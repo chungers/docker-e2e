@@ -61,12 +61,13 @@ var mainCmd = &cobra.Command{
 func init() {
 	mainCmd.AddCommand(
 		envCmd,
-		createCmd(),
+		createCmd,
 		execCmd,
 		runCmd,
 		sshCmd,
 		listCmd,
 		removeCmd,
+		infrakitCmd(),
 	)
 
 	logOptions := &logutil.ProdDefaults

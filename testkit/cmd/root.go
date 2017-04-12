@@ -1,15 +1,24 @@
 package cmd
 
 import (
+	"flag"
 	"io/ioutil"
 	"os"
 
 	"gopkg.in/yaml.v2"
 
+	"github.com/docker/infrakit/pkg/cli"
+	logutil "github.com/docker/infrakit/pkg/log"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/docker/docker-e2e/testkit/environment"
 	"github.com/spf13/cobra"
+)
+
+var (
+	Version  = "not-set"
+	Revision = "not-set"
 )
 
 const (
@@ -52,13 +61,18 @@ var mainCmd = &cobra.Command{
 func init() {
 	mainCmd.AddCommand(
 		envCmd,
-		createCmd,
+		createCmd(),
 		execCmd,
 		runCmd,
 		sshCmd,
 		listCmd,
 		removeCmd,
 	)
+
+	logOptions := &logutil.ProdDefaults
+	mainCmd.PersistentFlags().AddFlagSet(cli.Flags(logOptions))
+	mainCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
+
 }
 
 func Execute() error {

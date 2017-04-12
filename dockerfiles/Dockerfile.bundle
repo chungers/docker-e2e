@@ -1,0 +1,12 @@
+FROM golang:1.8-alpine
+
+RUN apk add --update \
+		git \
+                libvirt-client \
+                qemu-img \
+                openssh-client \
+		&& rm -rf /var/cache/apk/*  && mkdir -p /root/.ssh
+
+ADD build/* /usr/local/bin/
+
+ENTRYPOINT ["testkit"]

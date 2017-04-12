@@ -15,12 +15,12 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"text/template"
 	"time"
+
+	"net"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/docker/docker/client"
@@ -28,40 +28,15 @@ import (
 )
 
 var (
-	VirshDiskDir   = "/e2e"
-	VirshOSLinux   = "ubuntu16.04"
-	VirshOSWindows = "winnanors1"
+	VBoxDiskDir       string        // TODO Default path? (shouldn't be in the orca tree!)
+	VBoxOSLinux       = "centos7.0" // default
+	VBoxOSTypeLinux   = "Linux_64"
+	VBoxOSWindows     = "winnanors1"
+	VBoxOSTypeWindows = "WindowsNT_64"
+	vbm               = "VBoxManage"
 )
 
-const (
-	domainXMLTemplate = `<domain type='kvm'>
-  <name>{{.MachineName}}</name> <memory unit='M'>{{.Memory}}</memory>
-  <vcpu>{{.CPUCount}}</vcpu>
-  <features><acpi/><apic/><pae/></features>
-  <cpu mode='host-passthrough'></cpu>
-  <os>
-    <type>hvm</type>
-    <boot dev='hd'/>
-    <bootmenu enable='no'/>
-  </os>
-  <devices>
-    <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2' cache='unsafe' io='threads' />
-      <source file='{{.DiskPath}}'/>
-      <target dev='vda' bus='{{.DiskType}}'/>
-    </disk>
-    <graphics type='vnc' autoport='yes' listen='127.0.0.1'>
-      <listen type='address' address='127.0.0.1'/>
-    </graphics>
-    <interface type='network'>
-      <source network='default'/>
-      <model type='{{.NICType}}'/>
-    </interface>
-  </devices>
-</domain>`
-)
-
-type VirshMachine struct {
+type VBoxMachine struct {
 	MachineName string
 	dockerHost  string
 	tlsConfig   *tls.Config
@@ -76,49 +51,48 @@ type VirshMachine struct {
 	isWindows   bool
 	DiskType    string
 	NICType     string
+	OSType      string
+	DiskCtrl    string
 }
 
 func init() {
-	diskDir := os.Getenv("VIRSH_DISK_DIR")
-	if diskDir != "" {
-		VirshDiskDir = diskDir
-	}
-	baseOSLinux := os.Getenv("VIRSH_OS_LINUX")
+	VBoxDiskDir = os.Getenv("VBOX_DISK_DIR")
+	baseOSLinux := os.Getenv("VBOX_OS_LINUX")
 	if baseOSLinux != "" {
-		VirshOSLinux = baseOSLinux
+		VBoxOSLinux = baseOSLinux
 	}
-	baseOSWindows := os.Getenv("VIRSH_OS_WINDOWS")
+	baseOSWindows := os.Getenv("VBOX_OS_WINDOWS")
 	if baseOSWindows != "" {
-		VirshOSWindows = baseOSWindows
+		VBoxOSWindows = baseOSWindows
 	}
 }
 
-func getActiveMachines() []string {
-	cmd := exec.Command("virsh", "-q", "list")
+func getVBoxActiveMachines() []string {
+	cmd := exec.Command(vbm, "list", "runningvms")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Info("Failed to get list - assuming no VMs: %s", err)
 	}
-	nameRegex := regexp.MustCompile(`\s+(\S+)\s+running`)
+
 	machines := []string{}
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
-		matches := nameRegex.FindStringSubmatch(line)
-		if len(matches) > 0 {
-			machines = append(machines, matches[1])
+		s := strings.SplitN(line, `"`, 3)
+		if len(s) == 3 {
+			machines = append(machines, s[1])
 		}
 	}
 	return machines
 }
 
-// Generate a new machine using docker-machine CLI
-func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error) {
-	if VirshDiskDir == "" {
-		return nil, nil, fmt.Errorf("To use the vrish driver, you must set VIRSH_DISK_DIR to point to where your base OS disks and ssh key live")
+func NewVBoxMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error) {
+
+	if VBoxDiskDir == "" {
+		return nil, nil, fmt.Errorf("To use the vbox driver, you must set VBOX_DISK_DIR to point to where your base OS disks and ssh key live")
 	}
 
-	baseOSLinux := filepath.Join(VirshDiskDir, VirshOSLinux+".qcow2")
-	baseOSWindows := filepath.Join(VirshDiskDir, VirshOSWindows+".qcow2")
+	baseOSLinux := filepath.Join(VBoxDiskDir, VBoxOSLinux+".qcow2")
+	baseOSWindows := filepath.Join(VBoxDiskDir, VBoxOSWindows+".qcow2")
 
 	if linuxCount > 0 {
 		if _, err := os.Stat(baseOSLinux); err != nil {
@@ -131,35 +105,31 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 		}
 	}
 
-	// Check for existence of an ssh key, and skip if not found
-	sshKeyPath := filepath.Join(VirshDiskDir, "id_rsa")
-	if _, err := os.Stat(sshKeyPath); err != nil {
-		log.Debugf("No ssh key found, assuming password-less login. (%s)", sshKeyPath)
-		sshKeyPath = ""
-	}
-
 	timer := time.NewTimer(60 * time.Minute) // TODO - make configurable
 	errChan := make(chan error)
-	resChan := make(chan []*VirshMachine)
+	resChan := make(chan []*VBoxMachine)
 
 	go func() {
-		log.Infof("Creating %d linux VMs based on %s", linuxCount, VirshOSLinux)
+		log.Debugf("Attempting %s machine creation for %d nodes", VBoxOSLinux, linuxCount)
 		id, _ := rand.Int(rand.Reader, big.NewInt(0xffffff))
-		linuxMachines := []*VirshMachine{}
-		windowsMachines := []*VirshMachine{}
+		linuxMachines := []*VBoxMachine{}
+		windowsMachines := []*VBoxMachine{}
+
 		index := 0
 		for ; index < linuxCount; index++ {
-			m := &VirshMachine{
+			m := &VBoxMachine{
 				MachineName: fmt.Sprintf("%s-%X-%d", NamePrefix, id, index),
 				BaseDisk:    baseOSLinux,
 				CPUCount:    1,        // TODO - make configurable
 				Memory:      2048,     // TODO - make configurable
 				sshUser:     "docker", // TODO - make configurable
-				sshKeyPath:  sshKeyPath,
-				DiskType:    "virtio",
+				sshKeyPath:  filepath.Join(VBoxDiskDir, "id_rsa"),
+				DiskType:    "sata",
 				NICType:     "virtio",
+				DiskCtrl:    "IntelAHCI",
+				OSType:      VBoxOSTypeLinux,
 			}
-			if err := m.cloneDisk(); err != nil {
+			if err := m.convertDisk(); err != nil {
 				errChan <- err
 				return
 			}
@@ -171,12 +141,12 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 				errChan <- err
 				return
 			}
-			cert, err := tls.LoadX509KeyPair(filepath.Join(VirshDiskDir, "cert.pem"), filepath.Join(VirshDiskDir, "key.pem"))
+			cert, err := tls.LoadX509KeyPair(filepath.Join(VBoxDiskDir, "cert.pem"), filepath.Join(VBoxDiskDir, "key.pem"))
 			if err != nil {
 				errChan <- err
 				return
 			}
-			caCert, err := ioutil.ReadFile(filepath.Join(VirshDiskDir, "ca.pem"))
+			caCert, err := ioutil.ReadFile(filepath.Join(VBoxDiskDir, "ca.pem"))
 			if err != nil {
 				errChan <- err
 				return
@@ -193,19 +163,22 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 			}
 			linuxMachines = append(linuxMachines, m)
 		}
-		log.Infof("Creating %d windows VMs based on %s", windowsCount, VirshOSWindows)
+
+		log.Debugf("Creating %d windows VMs based on %s", windowsCount, VBoxOSWindows)
 		for ; index-linuxCount < windowsCount; index++ {
-			m := &VirshMachine{
+			m := &VBoxMachine{
 				MachineName: fmt.Sprintf("%s-%X-%d", NamePrefix, id, index),
 				BaseDisk:    baseOSWindows,
 				CPUCount:    1,        // TODO - make configurable
 				Memory:      2048,     // TODO - make configurable
 				sshUser:     "docker", // TODO - make configurable
-				sshKeyPath:  filepath.Join(VirshDiskDir, "id_rsa"),
+				sshKeyPath:  filepath.Join(VBoxDiskDir, "id_rsa"),
 				DiskType:    "ide",
-				NICType:     "e1000",
+				NICType:     "82540EM",
+				DiskCtrl:    "PIIX4",
+				OSType:      VBoxOSTypeWindows,
 			}
-			if err := m.cloneDisk(); err != nil {
+			if err := m.convertDisk(); err != nil {
 				errChan <- err
 				return
 			}
@@ -217,12 +190,12 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 				errChan <- err
 				return
 			}
-			cert, err := tls.LoadX509KeyPair(filepath.Join(VirshDiskDir, "cert.pem"), filepath.Join(VirshDiskDir, "key.pem"))
+			cert, err := tls.LoadX509KeyPair(filepath.Join(VBoxDiskDir, "cert.pem"), filepath.Join(VBoxDiskDir, "key.pem"))
 			if err != nil {
 				errChan <- err
 				return
 			}
-			caCert, err := ioutil.ReadFile(filepath.Join(VirshDiskDir, "ca.pem"))
+			caCert, err := ioutil.ReadFile(filepath.Join(VBoxDiskDir, "ca.pem"))
 			if err != nil {
 				errChan <- err
 				return
@@ -242,20 +215,21 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 
 		var wg sync.WaitGroup
 
-		res := []*VirshMachine{}
+		res := []*VBoxMachine{}
 		machineErrChan := make(chan error, linuxCount+windowsCount)
 		for _, m := range linuxMachines {
 			wg.Add(1)
-			go func(m *VirshMachine) {
+			go func(m *VBoxMachine) {
 				var result error
 				// Set the hostname
 				out, err := m.MachineSSH(
-					fmt.Sprintf(`sudo hostname "%s"; sudo sed -e 's/.*/%s/' -i /etc/hostname; sudo sed -e 's/127\.0\.1\.1.*/127.0.1.1 %s/' -i /etc/hosts`,
-						m.GetName(), m.GetName(), m.GetName()))
+					fmt.Sprintf(`sudo hostname "%s"; sudo sed -e 's/.*/%s/' -i /etc/hostname`,
+						m.GetName(), m.GetName()))
 				if err != nil {
 					log.Warnf("Failed to set hostname to %s: %s: %s", m.GetName(), err, out)
 				}
-				result = VerifyDockerEngine(m, VirshDiskDir)
+
+				result = VerifyDockerEngine(m, VBoxDiskDir)
 
 				machineErrChan <- result
 				wg.Done()
@@ -264,7 +238,7 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 		}
 		for _, m := range windowsMachines {
 			wg.Add(1)
-			go func(m *VirshMachine) {
+			go func(m *VBoxMachine) {
 				var result error
 				out, err := m.MachineSSH(
 					fmt.Sprintf(`powershell rename-computer -newname "%s" -restart`, m.GetName()))
@@ -273,7 +247,7 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 				}
 				// Give it a few seconds to reboot before we start hammering on it...
 				time.Sleep(5 * time.Second) // TODO - need a better way to tell if we've finished the reboot
-				result = VerifyDockerEngineWindows(m, VirshDiskDir)
+				result = VerifyDockerEngineWindows(m, VBoxDiskDir)
 				machineErrChan <- result
 				wg.Done()
 			}(m)
@@ -285,8 +259,8 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 			if err != nil {
 				log.Debugf("XXX sleeping for 10s to allow you to suspend and poke around")
 				time.Sleep(10 * time.Second)
-				// Detected errors, destroy all the machines we created
-				for _, m := range append(linuxMachines, windowsMachines...) {
+				//Detected errors, destroy all the machines we created
+				for _, m := range linuxMachines {
 					m.Remove()
 				}
 				errChan <- err
@@ -307,7 +281,7 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 				linuxMachines = append(linuxMachines, m)
 			}
 		}
-		return linuxMachines, windowsMachines, nil
+		return linuxMachines, nil, nil
 	case err := <-errChan:
 		return nil, nil, err
 	case <-timer.C:
@@ -315,158 +289,113 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 	}
 }
 
-func VirshListEnvironments() ([]*Environment, error) {
-	envs := []*Environment{}
-	// Pattern match the machines to filer out noise, and group them
-	re := regexp.MustCompile(fmt.Sprintf(`(%s-[0-9A-F]+)-([0-9]+)`, NamePrefix))
-	for _, line := range getActiveMachines() {
-		match := re.FindStringSubmatch(line)
-		if match != nil {
-			envName := match[1]
-			m := &VirshMachine{MachineName: match[0]}
-			err := m.gatherMachineDetails()
-			if err != nil {
-				return nil, err
-			}
-			found := false
-			for _, env := range envs {
-				if env.StackName == envName {
-					found = true
-					env.Machines = append(env.Machines, m)
-				}
-			}
-			if !found {
-				envs = append(envs, &Environment{envName, []Machine{m}})
-			}
-		}
-	}
-	return envs, nil
-}
-
-func (m *VirshMachine) gatherMachineDetails() error {
-	m.GetIP()
-	// TODO - consider taking the plunge and parsing all the gory XML...
-	cmd := exec.Command("virsh", "vcpucount", m.MachineName, "--current")
-	data, err := cmd.CombinedOutput()
-	out := strings.TrimSpace(string(data))
-	if err != nil {
-		log.Warnf("Failed to gather CPU count %s: %s: %s", m.MachineName, err, out)
-	} else {
-		m.CPUCount, err = strconv.Atoi(out)
-	}
-
-	cmd = exec.Command("virsh", "domblklist", m.MachineName)
-	data, err = cmd.CombinedOutput()
-	if err != nil {
-		log.Warnf("Failed to gather disk info %s: %s: %s", m.MachineName, err, out)
-	} else {
-		// Bleck!
-		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		re := regexp.MustCompile(`\S+\s+(\S+)`)
-		if len(lines) > 2 {
-			match := re.FindStringSubmatch(lines[2]) // Skip the two lines of header
-			if match != nil {
-				// Assume the ssh key is right next to the disk
-				m.sshKeyPath = filepath.Join(path.Dir(match[1]), "id_rsa")
-			}
-
-		}
-	}
-	m.sshUser = "docker"
-	return nil
-}
-
-func VirshDestroyEnvironment(name string) error {
-	re := regexp.MustCompile(fmt.Sprintf(`%s-[0-9]+`, name))
-	for _, line := range getActiveMachines() {
-		match := re.FindStringSubmatch(line)
-		if match != nil {
-			diskPath := filepath.Join(VirshDiskDir, line+".qcow2") // XXX Potentially fragile
-			cmd := exec.Command("virsh", "destroy", line)
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				log.Warn(string(out))
-			}
-			cmd = exec.Command("virsh", "undefine", "--storage", diskPath, line)
-			out, err = cmd.CombinedOutput()
-			if err != nil {
-				log.Error(string(out))
-				return err
-			}
-
-			// If the disk still exists, nuke it, but ignore errors
-			os.Remove(diskPath)
-
-			log.Infof("Machine %s deleted", line)
-		}
-	}
-	return nil
-}
-
-func (m *VirshMachine) cloneDisk() error {
+func (m *VBoxMachine) convertDisk() error {
 	dir := path.Dir(m.BaseDisk)
-	linkedCloneName := filepath.Join(dir, m.MachineName+".qcow2")
-	if _, err := os.Stat(linkedCloneName); err == nil {
-		return fmt.Errorf("Linked clone %s of base disk %s already exists!", linkedCloneName, m.BaseDisk)
+	convertedName := filepath.Join(dir, m.MachineName+".vdi")
+	if _, err := os.Stat(convertedName); err == nil {
+		return fmt.Errorf("Image %s of base disk %s already exists!", convertedName, m.BaseDisk)
 	}
-	log.Debugf("Creating linked clone %s with base disk %s", linkedCloneName, m.BaseDisk)
-	cmd := exec.Command("qemu-img", "create", "-f", "qcow2", "-o", "backing_fmt=qcow2", "-b", m.BaseDisk, linkedCloneName)
+	log.Debugf("Creating %s with base disk %s", convertedName, m.BaseDisk)
+	cmd := exec.Command("qemu-img", "convert", "-f", "qcow2", "-O", "vdi", m.BaseDisk, convertedName)
+
 	data, err := cmd.CombinedOutput()
 	out := strings.TrimSpace(string(data))
 	if err != nil {
-		return fmt.Errorf("Failed to create linked clone %s on %s: %s: %s", linkedCloneName, m.BaseDisk, out, err)
+		return fmt.Errorf("Failed to convert image %s on %s: %s: %s", convertedName, m.BaseDisk, out, err)
 	}
 	log.Debug(out)
-	m.DiskPath = linkedCloneName
+	m.DiskPath = convertedName
 	return nil
 }
 
-func (m *VirshMachine) define() error {
+func (m *VBoxMachine) define() error {
 	log.Debugf("Creating vm %s", m.MachineName)
-	tmpl, err := template.New("domain").Parse(domainXMLTemplate)
-	if err != nil {
-		return err
-	}
-	var xml bytes.Buffer
-	err = tmpl.Execute(&xml, m)
-	if err != nil {
-		return err
-	}
 
-	// Write it out to a temporary file
-	defFile := filepath.Join(path.Dir(m.DiskPath), m.MachineName+".xml")
-	err = ioutil.WriteFile(defFile, xml.Bytes(), 0644)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(defFile)
-
-	cmd := exec.Command("virsh", "define", defFile)
+	cmd := exec.Command(vbm, "createvm", "--name", m.MachineName, "--register")
 	data, err := cmd.CombinedOutput()
 	out := strings.TrimSpace(string(data))
 	if err != nil {
-		return fmt.Errorf("Failed to create %s: %s: %s", m.MachineName, err, out)
+		return fmt.Errorf("Failed to createvm %s: %s: %s", m.MachineName, err, out)
 	}
+
+	log.Debugf("Setting OS type to %s", m.OSType)
+	cmd = exec.Command(vbm, "modifyvm", m.MachineName, "--ostype", m.OSType)
+	data, err = cmd.CombinedOutput()
+	out = strings.TrimSpace(string(data))
+	if err != nil {
+		return fmt.Errorf("Failed to change vm ostype %s: %s: %s: %s", m.MachineName, m.OSType, err, out)
+	}
+
+	cmd = exec.Command(vbm, "modifyvm", m.MachineName, "--memory", strconv.Itoa(m.Memory))
+	data, err = cmd.CombinedOutput()
+	out = strings.TrimSpace(string(data))
+	if err != nil {
+		return fmt.Errorf("Failed to change vm memory %s: %s: %s:", m.MachineName, err, out)
+	}
+
+	diskName := strings.ToUpper(m.DiskType)
+	cmd = exec.Command(vbm, "storagectl", m.MachineName, "--name", diskName, "--add", m.DiskType, "--controller", m.DiskCtrl, "--bootable", "on")
+	data, err = cmd.CombinedOutput()
+	out = strings.TrimSpace(string(data))
+	if err != nil {
+		return fmt.Errorf("Failed to add vm storage ctl %s: %s: %s", m.MachineName, err, out)
+	}
+
+	log.Debugf("Attaching storage at %s", m.DiskPath)
+	cmd = exec.Command(vbm, "storageattach", m.MachineName, "--storagectl", diskName, "--port", "0", "--device", "0", "--type", "hdd", "--medium", m.DiskPath)
+	data, err = cmd.CombinedOutput()
+	out = strings.TrimSpace(string(data))
+	if err != nil {
+		return fmt.Errorf("Failed to attach vm storage %s: %s: %s: %s", m.MachineName, m.DiskPath, err, out)
+	}
+
+	if m.OSType == VBoxOSTypeWindows {
+
+		cmd = exec.Command(vbm, "modifyvm", m.MachineName, "--ioapic", "on")
+		data, err = cmd.CombinedOutput()
+		out = strings.TrimSpace(string(data))
+		if err != nil {
+			return fmt.Errorf("Failed to turn on ioapic %s: %s: %s", m.MachineName, err, out)
+		}
+	}
+
+	log.Debug("Setting network")
+
+	cmd = exec.Command(vbm, "modifyvm", m.MachineName, "--nic1", "nat", "--nictype1", m.NICType, "--cableconnected1", "on")
+	data, err = cmd.CombinedOutput()
+	out = strings.TrimSpace(string(data))
+	if err != nil {
+		return fmt.Errorf("Failed to set up network (nat) %s: %s: %s", m.MachineName, err, out)
+	}
+
+	cmd = exec.Command(vbm, "modifyvm", m.MachineName, "--nic2", "hostonly", "--nictype2", m.NICType, "--hostonlyadapter2", "vboxnet0", "--cableconnected2", "on")
+	data, err = cmd.CombinedOutput()
+	out = strings.TrimSpace(string(data))
+	if err != nil {
+		return fmt.Errorf("Failed to set up network (hostonly) %s: %s: %s", m.MachineName, err, out)
+	}
+
+	log.Debugf("Creating vm %s successful, ready to start", m.MachineName)
 	return nil
 }
 
 // GetName retrieves the machines name
-func (m *VirshMachine) GetName() string {
+func (m *VBoxMachine) GetName() string {
 	return m.MachineName
 }
 
 // GetDockerHost reports the machines docker host
-func (m *VirshMachine) GetDockerHost() string {
+func (m *VBoxMachine) GetDockerHost() string {
 	return m.dockerHost
 }
 
 // GetEngineAPIWithTimeout gets an engine API client with a default timeout
-func (m *VirshMachine) GetEngineAPI() (*client.Client, error) {
+func (m *VBoxMachine) GetEngineAPI() (*client.Client, error) {
 	return m.GetEngineAPIWithTimeout(Timeout)
 }
 
 // GetEngineAPIWithTimeout gets an engine API client with a timeout set
-func (m *VirshMachine) GetEngineAPIWithTimeout(timeout time.Duration) (*client.Client, error) {
+func (m *VBoxMachine) GetEngineAPIWithTimeout(timeout time.Duration) (*client.Client, error) {
 	transport := &http.Transport{
 		TLSClientConfig: m.tlsConfig,
 	}
@@ -474,13 +403,13 @@ func (m *VirshMachine) GetEngineAPIWithTimeout(timeout time.Duration) (*client.C
 		Transport: transport,
 		Timeout:   timeout,
 	}
-	version := "" // TODO
+	version := "" //TODO
 	return client.NewClient(m.dockerHost, version, httpClient, nil)
 }
 
 // IsRunning returns true if this machine is currently running
-func (m *VirshMachine) IsRunning() bool {
-	names := getActiveMachines()
+func (m *VBoxMachine) IsRunning() bool {
+	names := getVBoxActiveMachines()
 
 	for _, name := range names {
 		if m.MachineName == name {
@@ -491,8 +420,8 @@ func (m *VirshMachine) IsRunning() bool {
 	return false
 }
 
-// Remove the machiine after the tests have completed
-func (m *VirshMachine) Remove() error {
+// Remove the machine after the tests have completed
+func (m *VBoxMachine) Remove() error {
 	if os.Getenv("PRESERVE_TEST_MACHINE") != "" {
 		log.Infof("Skipping removal of machine %s with PRESERVE_TEST_MACHINE set", m.GetName())
 		return nil
@@ -501,7 +430,7 @@ func (m *VirshMachine) Remove() error {
 		m.Kill()
 	}
 
-	cmd := exec.Command("virsh", "undefine", "--storage", m.DiskPath, m.MachineName)
+	cmd := exec.Command(vbm, "unregistervm", m.MachineName, "--delete")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Error(string(out))
@@ -516,8 +445,8 @@ func (m *VirshMachine) Remove() error {
 	return nil
 }
 
-// Remove the machiine after the tests have completed
-func (m *VirshMachine) RemoveAndPreserveDisk() error {
+// Remove the machine after the tests have completed
+func (m *VBoxMachine) RemoveAndPreserveDisk() error {
 	if os.Getenv("PRESERVE_TEST_MACHINE") != "" {
 		log.Infof("Skipping removal of machine %s with PRESERVE_TEST_MACHINE set", m.GetName())
 		return nil
@@ -526,7 +455,7 @@ func (m *VirshMachine) RemoveAndPreserveDisk() error {
 		m.Stop()
 	}
 
-	cmd := exec.Command("virsh", "undefine", m.MachineName)
+	cmd := exec.Command(vbm, "unregistervm", m.MachineName)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Error(string(out))
@@ -541,8 +470,11 @@ func (m *VirshMachine) RemoveAndPreserveDisk() error {
 }
 
 // Stop gracefully shuts down the machine
-func (m *VirshMachine) Stop() error {
-	cmd := exec.Command("virsh", "shutdown", m.MachineName)
+func (m *VBoxMachine) Stop() error {
+	//TODO: make it gracefully shutdown
+	cmd := exec.Command(vbm, "controlvm", m.MachineName, "poweroff")
+
+	//cmd := exec.Command(vbm, "controlvm", m.MachineName, "acpipowerbutton")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Error(string(out))
@@ -553,8 +485,8 @@ func (m *VirshMachine) Stop() error {
 
 // Kill forcefully stops the virtual machine (likely to corrupt the machine, so
 // do not use this if you intend to start the machine again)
-func (m *VirshMachine) Kill() error {
-	cmd := exec.Command("virsh", "destroy", m.MachineName)
+func (m *VBoxMachine) Kill() error {
+	cmd := exec.Command(vbm, "controlvm", m.MachineName, "poweroff")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Error(string(out))
@@ -564,7 +496,7 @@ func (m *VirshMachine) Kill() error {
 	// Make sure it's stopped before returning...
 	resChan := make(chan error)
 
-	go func(m *VirshMachine) {
+	go func(m *VBoxMachine) {
 		for {
 			if !m.IsRunning() {
 				resChan <- nil
@@ -585,25 +517,58 @@ func (m *VirshMachine) Kill() error {
 }
 
 // Start powers on the VM
-func (m *VirshMachine) Start() error {
-	cmd := exec.Command("virsh", "start", m.MachineName)
-	out, err := cmd.CombinedOutput()
+func (m *VBoxMachine) Start() error {
+
+	cmd := exec.Command(vbm, "startvm", m.MachineName, "--type", "headless")
+	data, err := cmd.CombinedOutput()
+	out := strings.TrimSpace(string(data))
 	if err != nil {
-		log.Error(string(out))
+		return fmt.Errorf("Failed to start vm %s: %s: %s", m.MachineName, err, out)
+	}
+
+	resChan := make(chan error)
+
+	ips, err := generateIPs()
+	if err != nil {
 		return err
 	}
-	resChan := make(chan error)
-	// wait for it to power on (by checking virsh -q domifaddr m.GetName())
-	go func(m *VirshMachine) {
+
+	macAddress, err := getMACAddress(m.GetName())
+
+	if err != nil {
+		return err
+	}
+	log.Debugf("MAC address for %s is %s", m.GetName(), macAddress)
+
+	go func(m *VBoxMachine) {
+
 		log.Debugf("Waiting for IP to appear for %s", m.GetName())
-		m.GetIP()
+		for {
+			// Dial to all the IPs that is configured in vboxnet0.
+			for _, ip := range ips {
+				conn, err := net.DialTimeout("tcp", ip+":22", time.Duration(1)*time.Millisecond)
+				if err == nil {
+					conn.Close()
+				}
+			}
+
+			ip, err := findIPFromMAC(macAddress)
+			if err == nil {
+				m.ip = ip
+				m.internalip = ip
+				m.dockerHost = fmt.Sprintf("tcp://%s:2376", ip)
+				break
+			}
+
+			time.Sleep(1 * time.Second)
+		}
 		log.Debugf("Machine %s has IP %s", m.GetName(), m.ip)
 
 		// Loop until we can ssh in
 		for {
 			out, err := m.MachineSSH("uptime")
 			if err != nil && strings.Contains(out, "is not recognized as an internal or external command") {
-				log.Debug("Detected windows image booted")
+				log.Info("Detected windows image booted")
 				// TODO would be nice to give some basic "uptime" info... but that's kinda kludgy in windows...
 				m.isWindows = true
 				break
@@ -632,39 +597,17 @@ func (m *VirshMachine) Start() error {
 }
 
 // Return the public IP of the machine
-func (m *VirshMachine) GetIP() (string, error) {
-	for m.ip == "" { // TODO timeout if this hangs indefinitely...
-		ipRegex := regexp.MustCompile(`ipv4\s+([^/]+)`)
-		cmd := exec.Command("virsh", "-q", "domifaddr", m.GetName())
-		data, err := cmd.CombinedOutput()
-		out := strings.TrimSpace(string(data))
-		if err == nil {
-			lines := strings.Split(string(out), "\n")
-
-			if len(lines) > 0 {
-				matches := ipRegex.FindStringSubmatch(lines[0])
-				if len(matches) > 0 {
-					ip := matches[1]
-					m.ip = ip
-					m.internalip = ip
-					m.dockerHost = fmt.Sprintf("tcp://%s:2376", ip)
-					// TODO validate the IP looks good
-					break
-				}
-			}
-		}
-		time.Sleep(1 * time.Second)
-	}
+func (m *VBoxMachine) GetIP() (string, error) {
 	return m.ip, nil
 }
 
 // Get the internal IP (useful for join operations)
-func (m *VirshMachine) GetInternalIP() (string, error) {
+func (m *VBoxMachine) GetInternalIP() (string, error) {
 	return m.internalip, nil
 }
 
 // MachineSSH runs an ssh command and returns a string of the combined stdout/stderr output once done
-func (m *VirshMachine) MachineSSH(command string) (string, error) {
+func (m *VBoxMachine) MachineSSH(command string) (string, error) {
 	buf := bytes.Buffer{}
 	args := []string{
 		"ssh", "-q",
@@ -675,16 +618,15 @@ func (m *VirshMachine) MachineSSH(command string) (string, error) {
 		"-o", "CheckHostIP=no",
 		"-o", "ConnectTimeout=8",
 		"-o", "VerifyHostKeyDNS=no",
+		"-i", m.sshKeyPath,
+		m.sshUser + "@" + m.ip,
+		command,
 	}
-	if m.sshKeyPath != "" {
-		args = append(args, "-i", m.sshKeyPath)
-	}
-	args = append(args, m.sshUser+"@"+m.ip, command)
 	log.Debugf("SSH to %s: %v", m.MachineName, args)
 	cmd := exec.Command(args[0], args[1:]...)
 	tty, err := pty.Start(cmd)
 	if err != nil {
-		log.Debugf("Failed to establish tty for ssh command: %s", err)
+		log.Debugf("Failed to establish tty for ssh command")
 		return "", err
 	}
 	defer tty.Close()
@@ -708,23 +650,23 @@ func (m *VirshMachine) MachineSSH(command string) (string, error) {
 }
 
 // Get the contents of a specific file on the engine
-func (m *VirshMachine) CatHostFile(hostPath string) ([]byte, error) {
+func (m *VBoxMachine) CatHostFile(hostPath string) ([]byte, error) {
 	return CatHostFile(m, hostPath)
 }
 
 // Get the content of a directory as a tar file from the engine
-func (m *VirshMachine) TarHostDir(hostPath string) ([]byte, error) {
+func (m *VBoxMachine) TarHostDir(hostPath string) ([]byte, error) {
 	return TarHostDir(m, hostPath)
 }
 
 // IsWindows reports if this machines is a windows system - false means linux
-func (m *VirshMachine) IsWindows() bool {
+func (m *VBoxMachine) IsWindows() bool {
 	return m.isWindows
 }
 
 // Write data from an io.Reader to a file on the machine with 0600 perms.
-func (m *VirshMachine) WriteFile(filePath string, data io.Reader) error {
-	f, err := ioutil.TempFile("/tmp", "E2ETestTempFile")
+func (m *VBoxMachine) WriteFile(filePath string, data io.Reader) error {
+	f, err := ioutil.TempFile("/tmp", "orcaTestTempFile")
 	if err != nil {
 		return err
 	}
@@ -738,21 +680,16 @@ func (m *VirshMachine) WriteFile(filePath string, data io.Reader) error {
 	return m.writeLocalFile(f.Name(), filePath)
 }
 
-func (m *VirshMachine) writeLocalFile(localFilePath, remoteFilePath string) error {
-	args := []string{
-		"scp", "-q",
+func (m *VBoxMachine) writeLocalFile(localFilePath, remoteFilePath string) error {
+	cmd := exec.Command("scp", "-i", m.sshKeyPath, "-q",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "GlobalKnownHostsFile=/dev/null",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "UpdateHostKeys=no",
 		"-o", "CheckHostIP=no",
 		"-o", "VerifyHostKeyDNS=no",
-	}
-	if m.sshKeyPath != "" {
-		args = append(args, "-i", m.sshKeyPath)
-	}
-	args = append(args, localFilePath, fmt.Sprintf("%s@%s:%s", m.sshUser, m.ip, remoteFilePath))
-	cmd := exec.Command(args[0], args[1:]...)
+		localFilePath,
+		fmt.Sprintf("%s@%s:%s", m.sshUser, m.ip, remoteFilePath))
 	data, err := cmd.CombinedOutput()
 	out := strings.TrimSpace(string(data))
 	if out != "" {
@@ -765,10 +702,10 @@ func (m *VirshMachine) writeLocalFile(localFilePath, remoteFilePath string) erro
 	return nil
 }
 
-func (m *VirshMachine) GetConnectionEnv() string {
+func (m *VBoxMachine) GetConnectionEnv() string {
 	return strings.Join([]string{
 		fmt.Sprintf(`export DOCKER_HOST="tcp://%s:2376"`, m.ip),
-		fmt.Sprintf(`export DOCKER_CERT_PATH="%s"`, VirshDiskDir),
+		fmt.Sprintf(`export DOCKER_CERT_PATH="%s"`, VBoxDiskDir),
 		fmt.Sprintf("# %s", m.MachineName),
 		fmt.Sprintf("# ssh -i %s %s@%s", m.sshKeyPath, m.sshUser, m.ip),
 		// TODO - once virsh generates valid SANs on derived certs add this

@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -68,9 +67,9 @@ var (
 		"windows": `{
     "debug": true,
     "tls": true,
-    "tlscacert": "c:\\ProgramData\\docker\\ca.pem",
-    "tlscert": "c:\\ProgramData\\docker\\cert.pem",
-    "tlskey": "c:\\ProgramData\\docker\\key.pem",
+    "tlscacert": "c:\\ProgramData\\docker\\daemoncerts\\ca.pem",
+    "tlscert": "c:\\ProgramData\\docker\\daemoncerts\\cert.pem",
+    "tlskey": "c:\\ProgramData\\docker\\daemoncerts\\key.pem",
     "tlsverify": true
 }
 `,
@@ -90,13 +89,15 @@ func getServerVersion(m Machine) (string, error) {
 		return "", fmt.Errorf("Failed to get engine client: %s", err)
 	}
 	deadline := time.Now().Add(20 * time.Second) // How long should we wait?
+	var lastErr error
 	for time.Now().Before(deadline) {
 		version, err := dclient.ServerVersion(context.Background())
 		if err == nil {
 			return version.Version, nil
 		}
+		lastErr = err
 	}
-	return "", fmt.Errorf("Failed to get engine version")
+	return "", fmt.Errorf("Failed to get engine version before timing out: %s", lastErr)
 
 }
 
@@ -106,6 +107,14 @@ func VerifyDockerEngine(m Machine, localCertDir string) error {
 	log.Debugf("Verifying or installing docker engine on %s", m.GetName())
 
 	resChan := make(chan error)
+	ip, err := m.GetIP()
+	if err != nil {
+		return err
+	}
+	internalIP, err := m.GetInternalIP()
+	if err != nil {
+		return err
+	}
 
 	go func(m Machine) {
 
@@ -151,18 +160,29 @@ func VerifyDockerEngine(m Machine, localCertDir string) error {
 				resChan <- fmt.Errorf("Failed to write daemon.json to %s: %s", m.GetName(), err)
 				return
 			}
-			for _, file := range []string{"ca.pem", "cert.pem", "key.pem"} {
-				localFile := filepath.Join(localCertDir, file)
-				fp, err := os.Open(localFile)
-				if err != nil {
-					resChan <- fmt.Errorf("Failed to open %s: %s", localFile, err)
-					return
-				}
-				err = m.WriteFile(filepath.Join("/etc/docker", file), fp)
-				if err != nil {
-					resChan <- fmt.Errorf("Failed to write %s to %s", file, m.GetName(), err)
-					return
-				}
+
+			ca, cert, key, err := GenerateNodeCerts(localCertDir, m.GetName(), []string{ip, internalIP, m.GetName()})
+			if err != nil {
+				resChan <- fmt.Errorf("Failed to write cert locally: %s", err)
+				return
+			}
+			cabuf := bytes.NewBuffer(ca)
+			err = m.WriteFile("/etc/docker/ca.pem", cabuf)
+			if err != nil {
+				resChan <- fmt.Errorf("Failed to write ca.pem to %s: %s", m.GetName(), err)
+				return
+			}
+			certbuf := bytes.NewBuffer(cert)
+			err = m.WriteFile("/etc/docker/cert.pem", certbuf)
+			if err != nil {
+				resChan <- fmt.Errorf("Failed to write cert.pem to %s: %s", m.GetName(), err)
+				return
+			}
+			keybuf := bytes.NewBuffer(key)
+			err = m.WriteFile("/etc/docker/key.pem", keybuf)
+			if err != nil {
+				resChan <- fmt.Errorf("Failed to write key.pem to %s: %s", m.GetName(), err)
+				return
 			}
 
 			installCMD := EngineInstallCMD
@@ -268,7 +288,7 @@ func VerifyDockerEngine(m Machine, localCertDir string) error {
 
 	}(m)
 
-	timer := time.NewTimer(2 * time.Minute) // TODO - make configurable
+	timer := time.NewTimer(5 * time.Minute) // TODO - make configurable
 	select {
 	case res := <-resChan:
 		return res
@@ -285,6 +305,15 @@ func VerifyDockerEngineWindows(m Machine, localCertDir string) error {
 	log.Debugf("Verifying or installing docker engine on windows machine %s", m.GetName())
 
 	resChan := make(chan error, 1)
+
+	ip, err := m.GetIP()
+	if err != nil {
+		return err
+	}
+	internalIP, err := m.GetInternalIP()
+	if err != nil {
+		return err
+	}
 
 	go func(m Machine) {
 
@@ -340,18 +369,34 @@ func VerifyDockerEngineWindows(m Machine, localCertDir string) error {
 				resChan <- fmt.Errorf("Failed to write daemon.json to %s: %s", m.GetName(), err)
 				return
 			}
-			for _, file := range []string{"ca.pem", "cert.pem", "key.pem"} {
-				localFile := filepath.Join(localCertDir, file)
-				fp, err := os.Open(localFile)
-				if err != nil {
-					resChan <- fmt.Errorf("Failed to open %s: %s", localFile, err)
-					return
-				}
-				err = m.WriteFile(fmt.Sprintf(`c:\ProgramData\docker\%s`, file), fp)
-				if err != nil {
-					resChan <- fmt.Errorf("Failed to write %s to %s", file, m.GetName(), err)
-					return
-				}
+
+			out, err = m.MachineSSH(`powershell mkdir c:\ProgramData\docker\daemoncerts`)
+			if err != nil {
+				resChan <- fmt.Errorf("Failed to create daemoncerts dir %s: %s", m.GetName(), err, out)
+				return
+			}
+			ca, cert, key, err := GenerateNodeCerts(localCertDir, m.GetName(), []string{ip, internalIP, m.GetName()})
+			if err != nil {
+				resChan <- fmt.Errorf("Failed to write cert locally: %s", err)
+				return
+			}
+			cabuf := bytes.NewBuffer(ca)
+			err = m.WriteFile(`c:\ProgramData\docker\daemoncerts\ca.pem`, cabuf)
+			if err != nil {
+				resChan <- fmt.Errorf("Failed to write ca.pem to %s: %s", m.GetName(), err)
+				return
+			}
+			certbuf := bytes.NewBuffer(cert)
+			err = m.WriteFile(`c:\ProgramData\docker\daemoncerts\cert.pem`, certbuf)
+			if err != nil {
+				resChan <- fmt.Errorf("Failed to write cert.pem to %s: %s", m.GetName(), err)
+				return
+			}
+			keybuf := bytes.NewBuffer(key)
+			err = m.WriteFile(`c:\ProgramData\docker\daemoncerts\key.pem`, keybuf)
+			if err != nil {
+				resChan <- fmt.Errorf("Failed to write key.pem to %s: %s", m.GetName(), err)
+				return
 			}
 
 			out, err = m.MachineSSH("powershell dockerd.exe -H npipe:////./pipe/docker_engine -H 0.0.0.0:2376 --register-service")
@@ -392,6 +437,8 @@ func VerifyDockerEngineWindows(m Machine, localCertDir string) error {
 				if err == nil {
 					log.Infof("Succesfully installed engine %s on %s", ver, m.GetName())
 					break
+				} else {
+					log.Debugf("Error getting version: %s", err)
 				}
 				time.Sleep(500 * time.Millisecond)
 			}

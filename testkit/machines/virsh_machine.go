@@ -116,6 +116,10 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 	if VirshDiskDir == "" {
 		return nil, nil, fmt.Errorf("To use the vrish driver, you must set VIRSH_DISK_DIR to point to where your base OS disks and ssh key live")
 	}
+	err := VerifyCA(VirshDiskDir)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	baseOSLinux := filepath.Join(VirshDiskDir, VirshOSLinux+".qcow2")
 	baseOSWindows := filepath.Join(VirshDiskDir, VirshOSWindows+".qcow2")
@@ -138,7 +142,7 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 		sshKeyPath = ""
 	}
 
-	timer := time.NewTimer(60 * time.Minute) // TODO - make configurable
+	timer := time.NewTimer(5 * time.Minute) // TODO - make configurable
 	errChan := make(chan error)
 	resChan := make(chan []*VirshMachine)
 
@@ -186,10 +190,6 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 			m.tlsConfig = &tls.Config{
 				Certificates: []tls.Certificate{cert},
 				RootCAs:      caCertPool,
-
-				// NOTE:This is insecure, but the test VMs have a short-lifespan
-				InsecureSkipVerify: true, // We don't verify so we can recyle the same certs regardless of VM IP
-
 			}
 			linuxMachines = append(linuxMachines, m)
 		}
@@ -201,7 +201,7 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 				CPUCount:    1,        // TODO - make configurable
 				Memory:      2048,     // TODO - make configurable
 				sshUser:     "docker", // TODO - make configurable
-				sshKeyPath:  filepath.Join(VirshDiskDir, "id_rsa"),
+				sshKeyPath:  sshKeyPath,
 				DiskType:    "ide",
 				NICType:     "e1000",
 			}
@@ -232,10 +232,6 @@ func NewVirshMachines(linuxCount, windowsCount int) ([]Machine, []Machine, error
 			m.tlsConfig = &tls.Config{
 				Certificates: []tls.Certificate{cert},
 				RootCAs:      caCertPool,
-
-				// NOTE:This is insecure, but the test VMs have a short-lifespan
-				InsecureSkipVerify: true, // We don't verify so we can recyle the same certs regardless of VM IP
-
 			}
 			windowsMachines = append(windowsMachines, m)
 		}
@@ -580,7 +576,7 @@ func (m *VirshMachine) Kill() error {
 		log.Debugf("Got %v on resChan", res)
 		return res
 	case <-timer.C:
-		return fmt.Errorf("Unable to verify docker engine on %s within timeout", m.MachineName)
+		return fmt.Errorf("Unable to kill docker engine on %s within timeout", m.MachineName)
 	}
 }
 
@@ -766,12 +762,16 @@ func (m *VirshMachine) writeLocalFile(localFilePath, remoteFilePath string) erro
 }
 
 func (m *VirshMachine) GetConnectionEnv() string {
-	return strings.Join([]string{
+	lines := []string{
 		fmt.Sprintf(`export DOCKER_HOST="tcp://%s:2376"`, m.ip),
 		fmt.Sprintf(`export DOCKER_CERT_PATH="%s"`, VirshDiskDir),
+		"export DOCKER_TLS_VERIFY=1",
 		fmt.Sprintf("# %s", m.MachineName),
-		fmt.Sprintf("# ssh -i %s %s@%s", m.sshKeyPath, m.sshUser, m.ip),
-		// TODO - once virsh generates valid SANs on derived certs add this
-		// "export DOCKER_TLS_VERIFY=1",
-	}, "\n")
+	}
+	if m.sshKeyPath != "" {
+		lines = append(lines, fmt.Sprintf("# ssh -i %s %s@%s", m.sshKeyPath, m.sshUser, m.ip))
+	} else {
+		lines = append(lines, fmt.Sprintf("# ssh %s@%s", m.sshUser, m.ip))
+	}
+	return strings.Join(lines, "\n")
 }

@@ -68,9 +68,9 @@ var (
 		"windows": `{
     "debug": true,
     "tls": true,
-    "tlscacert": "c:\\ProgramData\\docker\\ca.pem",
-    "tlscert": "c:\\ProgramData\\docker\\cert.pem",
-    "tlskey": "c:\\ProgramData\\docker\\key.pem",
+    "tlscacert": "c:\\ProgramData\\docker\\daemoncerts\\ca.pem",
+    "tlscert": "c:\\ProgramData\\docker\\daemoncerts\\cert.pem",
+    "tlskey": "c:\\ProgramData\\docker\\daemoncerts\\key.pem",
     "tlsverify": true
 }
 `,
@@ -359,6 +359,12 @@ func VerifyDockerEngineWindows(m Machine, localCertDir string) error {
 				resChan <- fmt.Errorf("Failed to write daemon.json to %s: %s", m.GetName(), err)
 				return
 			}
+
+			out, err = m.MachineSSH(`powershell mkdir c:\ProgramData\docker\daemoncerts`)
+			if err != nil {
+				resChan <- fmt.Errorf("Failed to create daemoncerts dir %s: %s", m.GetName(), err, out)
+				return
+			}
 			for _, file := range []string{"ca.pem", "cert.pem", "key.pem"} {
 				localFile := filepath.Join(localCertDir, file)
 				fp, err := os.Open(localFile)
@@ -366,7 +372,7 @@ func VerifyDockerEngineWindows(m Machine, localCertDir string) error {
 					resChan <- fmt.Errorf("Failed to open %s: %s", localFile, err)
 					return
 				}
-				err = m.WriteFile(fmt.Sprintf(`c:\ProgramData\docker\%s`, file), fp)
+				err = m.WriteFile(fmt.Sprintf(`c:\ProgramData\docker\daemoncerts\%s`, file), fp)
 				if err != nil {
 					resChan <- fmt.Errorf("Failed to write %s to %s", file, m.GetName(), err)
 					return
